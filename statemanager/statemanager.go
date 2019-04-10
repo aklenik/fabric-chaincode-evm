@@ -29,17 +29,25 @@ type stateManager struct {
 	// We will be looking into adding a cache for accounts later
 	// The cache can be single threaded because the statemanager is 1-1 with the evm which is single threaded.
 	cache map[string]binary.Word256
+	accountCache map[string]*acm.Account
 }
 
 func NewStateManager(stub shim.ChaincodeStubInterface) StateManager {
 	return &stateManager{
 		stub:  stub,
 		cache: make(map[string]binary.Word256),
+		accountCache: make(map[string]*acm.Account),
 	}
 }
 
 func (s *stateManager) GetAccount(address crypto.Address) (*acm.Account, error) {
-	acctBytes, err := s.stub.GetState(strings.ToLower(address.String()))
+	key := strings.ToLower(address.String())
+
+	if val, ok := s.accountCache[key]; ok {
+		return val, nil
+	}
+
+	acctBytes, err := s.stub.GetState(key)
 	if err != nil {
 		return nil, err
 	}
@@ -71,11 +79,26 @@ func (s *stateManager) UpdateAccount(updatedAccount *acm.Account) error {
 	if err != nil {
 		return err
 	}
-	return s.stub.PutState(hex.EncodeToString(updatedAccount.Address.Bytes()), encodedAcct)
+
+	key := hex.EncodeToString(updatedAccount.Address.Bytes())
+	err = s.stub.PutState(key, encodedAcct)
+
+	if err == nil {
+		s.accountCache[key] = updatedAccount
+	}
+
+	return err
 }
 
 func (s *stateManager) RemoveAccount(address crypto.Address) error {
-	return s.stub.DelState(strings.ToLower(address.String()))
+	key := strings.ToLower(address.String())
+	err := s.stub.DelState(key)
+
+	if err == nil {
+		delete(s.accountCache, key)
+	}
+
+	return err
 }
 
 func (s *stateManager) SetStorage(address crypto.Address, key, value binary.Word256) error {

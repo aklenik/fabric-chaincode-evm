@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"strings"
+	"strconv"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/burrow/acm"
@@ -21,7 +22,6 @@ import (
 	"github.com/hyperledger/burrow/permission"
 	"github.com/hyperledger/fabric-chaincode-evm/eventmanager"
 	"github.com/hyperledger/fabric-chaincode-evm/statemanager"
-	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/chaincode/shim"
 	"github.com/hyperledger/fabric/protos/msp"
 	pb "github.com/hyperledger/fabric/protos/peer"
@@ -38,7 +38,7 @@ var ContractPerms = permission.AccountPermissions{
 	},
 }
 
-var logger = flogging.MustGetLogger("evmcc")
+var logger = shim.NewLogger("evmcc")
 var evmLogger = logging.NewNoopLogger()
 
 type EvmChaincode struct{}
@@ -52,18 +52,30 @@ func (evmcc *EvmChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response 
 	// We always expect 2 args: 'callee address, input data' or ' getCode ,  contract address'
 	args := stub.GetArgs()
 
-	if len(args) == 1 {
+	if len(args) > 0 {
 		if string(args[0]) == "account" {
 			return evmcc.account(stub)
 		}
+
+		if string(args[0]) == "getBalance" {
+			return evmcc.getBalance(stub)
+		}
 	}
 
-	if len(args) != 2 {
-		return shim.Error(fmt.Sprintf("expects 2 args, got %d : %s", len(args), string(args[0])))
+	if (len(args) < 2) && (len(args) >4) {
+		return shim.Error(fmt.Sprintf("expects [2,4] args, got %d : %s", len(args), string(args[0])))
 	}
 
 	if string(args[0]) == "getCode" {
 		return evmcc.getCode(stub, args[1])
+	}
+
+	if string(args[0]) == "addToBalance" {
+		return evmcc.modifyBalance(stub, args[1], "add")
+	}
+
+	if string(args[0]) == "subtractFromBalance" {
+		return evmcc.modifyBalance(stub, args[1], "sub")
 	}
 
 	c, err := hex.DecodeString(string(args[0]))
@@ -89,6 +101,20 @@ func (evmcc *EvmChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response 
 	}
 
 	var gas uint64 = 10000
+	var weiValue uint64 = 0
+
+	if len(args) == 3 {
+		weiValue, err = strconv.ParseUint(string(args[2]), 10, 64)
+		if err != nil {
+			return shim.Error(fmt.Sprintf("failed to parse wei value: %s", err))
+		}
+	}
+
+	nonceString := stub.GetTxID()
+	if len(args) == 4 {
+		nonceString = string(args[3])
+	}
+
 	state := statemanager.NewStateManager(stub)
 	evmCache := evm.NewState(state, func(height uint64) []byte {
 		// This function is to be used to return the block hash
@@ -98,7 +124,7 @@ func (evmcc *EvmChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response 
 		panic("Block Hash shouldn't be called")
 	})
 	eventSink := &eventmanager.EventManager{Stub: stub}
-	nonce := crypto.Nonce(callerAddr, []byte(stub.GetTxID()))
+	nonce := crypto.Nonce(callerAddr, []byte(nonceString))
 	vm := evm.NewVM(newParams(), callerAddr, nonce, evmLogger)
 
 	if calleeAddr == crypto.ZeroAddress {
@@ -117,7 +143,7 @@ func (evmcc *EvmChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response 
 			return shim.Error(fmt.Sprintf("failed to set contract account permissions: %s ", evmErr))
 		}
 
-		rtCode, evmErr := vm.Call(evmCache, eventSink, callerAddr, contractAddr, input, input, 0, &gas)
+		rtCode, evmErr := vm.Call(evmCache, eventSink, callerAddr, contractAddr, input, input, weiValue, &gas)
 		if evmErr != nil {
 			return shim.Error(fmt.Sprintf("failed to deploy code: %s", evmErr))
 		}
@@ -149,7 +175,7 @@ func (evmcc *EvmChaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response 
 			return shim.Error(fmt.Sprintf("failed to retrieve contract code: %s", evmErr))
 		}
 
-		output, evmErr := vm.Call(evmCache, eventSink, callerAddr, calleeAddr, calleeCode, input, 0, &gas)
+		output, evmErr := vm.Call(evmCache, eventSink, callerAddr, calleeAddr, calleeCode, input, weiValue, &gas)
 		if evmErr != nil {
 			return shim.Error(fmt.Sprintf("failed to execute contract: %s", evmErr))
 		}
@@ -217,6 +243,80 @@ func (evmcc *EvmChaincode) account(stub shim.ChaincodeStubInterface) pb.Response
 	return shim.Success([]byte(callerAddr.String()))
 }
 
+func (evmcc *EvmChaincode) getBalance(stub shim.ChaincodeStubInterface) pb.Response {
+	state := statemanager.NewStateManager(stub)
+	evmCache := evm.NewState(state, func(height uint64) []byte {
+		// This function is to be used to return the block hash
+		// Currently EVMCC does not support the BLOCKHASH opcode.
+		// This function is only used for that opcode and will not
+		// affect execution if BLOCKHASH is not called.
+		panic("Block Hash shouldn't be called")
+	})
+
+	callerAddress, err := getCallerAddress(stub)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("error while getting caller address: %s", err))
+	}
+
+	if !evmCache.Exists(callerAddress) {
+		return shim.Success([]byte(strconv.FormatUint(0, 10)))
+	}
+
+	return shim.Success([]byte(strconv.FormatUint(evmCache.GetBalance(callerAddress), 10)))
+}
+
+func (evmcc *EvmChaincode) modifyBalance(stub shim.ChaincodeStubInterface, valueBytes []byte, op string) pb.Response {
+	value, err := strconv.ParseUint(string(valueBytes), 10, 64)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("error while parsing value in modifyBalance: %s", err))
+	}
+
+	state := statemanager.NewStateManager(stub)
+	evmCache := evm.NewState(state, func(height uint64) []byte {
+		// This function is to be used to return the block hash
+		// Currently EVMCC does not support the BLOCKHASH opcode.
+		// This function is only used for that opcode and will not
+		// affect execution if BLOCKHASH is not called.
+		panic("Block Hash shouldn't be called")
+	})
+
+	callerAddress, err := getCallerAddress(stub)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("error while getting caller address in modifyBalance: %s", err))
+	}
+
+	if !evmCache.Exists(callerAddress) {
+		evmCache.CreateAccount(callerAddress)
+		if evmErr := evmCache.Error(); evmErr != nil {
+			return shim.Error(fmt.Sprintf("failed to create the user account: %s ", evmErr))
+		}
+
+		evmCache.SetPermission(callerAddress, ContractPermFlags, true)
+		if evmErr := evmCache.Error(); evmErr != nil {
+			return shim.Error(fmt.Sprintf("failed to set user account permissions: %s ", evmErr))
+		}
+	}
+
+	if op == "add" {
+		evmCache.AddToBalance(callerAddress, value)
+		if evmErr := evmCache.Error(); evmErr != nil {
+			return shim.Error(fmt.Sprintf("failed to increase balance: %s ", evmErr))
+		}
+	} else {
+		evmCache.SubtractFromBalance(callerAddress, value)
+		if evmErr := evmCache.Error(); evmErr != nil {
+			return shim.Error(fmt.Sprintf("failed to decrease balance: %s ", evmErr))
+		}
+	}
+
+	evmCache.Sync()
+	if evmErr := evmCache.Error(); evmErr != nil {
+		return shim.Error(fmt.Sprintf("failed to sync EVM cache: %s ", evmErr))
+	}
+
+	return shim.Success([]byte(strconv.FormatUint(evmCache.GetBalance(callerAddress), 10)))
+}
+
 func newParams() evm.Params {
 	return evm.Params{
 		BlockHeight: 0,
@@ -265,6 +365,6 @@ func identityToAddr(id []byte) (crypto.Address, error) {
 
 func main() {
 	if err := shim.Start(new(EvmChaincode)); err != nil {
-		logger.Infof("Error starting EVM chaincode: %s", err)
+		logger.Errorf("Error starting EVM chaincode: %s", err)
 	}
 }
